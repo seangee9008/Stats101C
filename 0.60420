@@ -1,0 +1,66 @@
+## ---------- 7. train logistic with CV, saving probabilities ----------
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,           # needed for probs
+  savePredictions = "final"         # keep CV preds for threshold tuning
+)
+
+fit_glm <- train(
+  x         = Xtr,
+  y         = ytr,
+  method    = "glm",
+  family    = binomial(),
+  trControl = ctrl,
+  metric    = "Accuracy"
+)
+
+print(fit_glm$results)
+
+## ---------- 7b. choose threshold using CV predictions ----------
+# fit_glm$pred has out-of-fold predictions for each row
+cv_pred <- fit_glm$pred
+
+# make sure the class label column name matches:
+# typically it's the same as levels(ytr), e.g. "Benign"/"Malignant"
+head(cv_pred)
+
+# probability that Cancer = "Malignant"
+p_cv <- cv_pred$Malignant   # if column is named differently, change this
+y_cv <- cv_pred$obs         # true label
+
+ths  <- seq(0.30, 0.70, by = 0.01)
+accs <- sapply(ths, function(t) {
+  pred <- ifelse(p_cv > t, "Malignant", "Benign")
+  mean(pred == y_cv)
+})
+
+best_t   <- ths[which.max(accs)]
+best_acc <- max(accs)
+
+cat("\nBest CV threshold:", best_t,
+    "\nCV accuracy at best_t:", round(best_acc, 4), "\n")
+
+## ---------- 8. predict on test set using tuned threshold ----------
+# get probabilities on full test set
+p_test <- predict(fit_glm, Xte, type = "prob")[, "Malignant"]
+
+test_pred <- ifelse(p_test > best_t, "Malignant", "Benign")
+test_pred <- factor(test_pred, levels = levels(ytr))  # keep label order consistent
+
+submission <- data.frame(
+  ID     = te_imp[[id_te]],
+  Cancer = test_pred,
+  check.names = FALSE
+)
+
+stopifnot(
+  ncol(submission) == 2,
+  all(names(submission) == c("ID", "Cancer")),
+  nrow(submission) == nrow(te_imp)
+)
+
+out_name <- sprintf("skin_cancer_filtered_thr_%.2f.csv", best_t)
+write.csv(submission, out_name, row.names = FALSE)
+
+cat("Submission written to:\n", normalizePath(out_name), "\n")
