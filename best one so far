@@ -1,0 +1,224 @@
+## ============================================================
+## 0. Libraries, helper, and data load
+## ============================================================
+
+library(caret)
+library(glmnet)
+
+set.seed(101)
+
+# Simple mode helper for categorical imputation
+Mode <- function(x) {
+  x <- x[!is.na(x)]
+  if (!length(x)) return(NA)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Paths (adjust if needed)
+train_path <- "~/Downloads/SkinCancerTrain.csv"
+test_path  <- "~/Downloads/SkinCancerTestNoY.csv"
+
+skin_tr <- read.csv(train_path, stringsAsFactors = FALSE)
+skin_te <- read.csv(test_path,  stringsAsFactors = FALSE)
+
+## ============================================================
+## 1. Drop hand-picked weak predictors
+## ============================================================
+
+drop_cols <- c(
+  "alcohol_drinks_per_week",
+  "zip_code_last_digit",
+  "desk_height_cm",
+  "monthly_screen_time_minutes",
+  "years_lived_at_address",
+  "near_high_power_cables",
+  "pets",
+  "income",
+  "music_genre",
+  "favorite_color",
+  "phone_brand",
+  "favorite_cuisine",
+  "uses_smartwatch",
+  "preferred_shoe_type",
+  "BMI",
+  "education",
+  "access_to_nude_beach",
+  "sunscreen_type",
+  "sunscreen_brand",
+  "occupation",
+  "exercise_freq_per_week"
+)
+
+keep_tr <- setdiff(names(skin_tr), drop_cols)
+keep_te <- setdiff(names(skin_te), drop_cols)
+
+skin_tr <- skin_tr[, keep_tr, drop = FALSE]
+skin_te <- skin_te[, keep_te, drop = FALSE]
+
+## ============================================================
+## 2. ID variable, target, numeric vs categorical predictors
+## ============================================================
+
+# Treat first column as ID in both files
+id_tr <- names(skin_tr)[1]
+id_te <- names(skin_te)[1]
+
+# Outcome as factor (Benign/Malignant; order inferred from data)
+skin_tr$Cancer <- factor(skin_tr$Cancer)
+
+# Numeric vs categorical predictors (exclude ID and Cancer)
+num_cols <- setdiff(
+  names(skin_tr)[sapply(skin_tr, is.numeric)],
+  c(id_tr, "Cancer")
+)
+
+cat_cols <- setdiff(
+  names(skin_tr),
+  c(num_cols, id_tr, "Cancer")
+)
+
+cat("Numeric predictors (", length(num_cols), "):\n", sep = "")
+cat(paste(num_cols, collapse = ", "), "\n\n")
+
+cat("Categorical predictors (", length(cat_cols), "):\n", sep = "")
+cat(paste(cat_cols, collapse = ", "), "\n\n")
+
+## ============================================================
+## 3. Simple train-median / train-mode imputation (no leakage)
+## ============================================================
+
+tr_imp <- skin_tr
+te_imp <- skin_te
+
+# Numeric: global TRAIN median
+for (nm in num_cols) {
+  med <- median(tr_imp[[nm]], na.rm = TRUE)
+  tr_imp[[nm]][is.na(tr_imp[[nm]])] <- med
+  te_imp[[nm]][is.na(te_imp[[nm]])] <- med
+}
+
+# Categorical: global TRAIN mode + align levels
+for (nm in cat_cols) {
+  tr_imp[[nm]] <- as.character(tr_imp[[nm]])
+  te_imp[[nm]] <- as.character(te_imp[[nm]])
+
+  md <- Mode(tr_imp[[nm]])
+  tr_imp[[nm]][is.na(tr_imp[[nm]])] <- md
+  te_imp[[nm]][is.na(te_imp[[nm]])] <- md
+
+  lv <- union(unique(tr_imp[[nm]]), unique(te_imp[[nm]]))
+  tr_imp[[nm]] <- factor(tr_imp[[nm]], levels = lv)
+  te_imp[[nm]] <- factor(te_imp[[nm]], levels = lv)
+}
+
+cat("Remaining NAs, Train:", sum(is.na(tr_imp)), "\n")
+cat("Remaining NAs, Test :", sum(is.na(te_imp)), "\n\n")
+
+## ============================================================
+## 4. Build model matrices (dummy-encoded, centered, scaled)
+## ============================================================
+
+Xtr_raw <- tr_imp[, !(names(tr_imp) %in% c(id_tr, "Cancer")), drop = FALSE]
+ytr     <- tr_imp$Cancer
+Xte_raw <- te_imp[, !(names(te_imp) %in% c(id_te)),          drop = FALSE]
+
+# Dummy encode categoricals
+dmy <- dummyVars(~ ., data = Xtr_raw, fullRank = TRUE)
+Xtr <- as.data.frame(predict(dmy, Xtr_raw))
+Xte <- as.data.frame(predict(dmy, Xte_raw))
+
+# Center + scale
+pp  <- preProcess(Xtr, method = c("center", "scale"))
+Xtr <- predict(pp, Xtr)
+Xte <- predict(pp, Xte)
+
+## ============================================================
+## 5. Train/validation split and ridge CV
+## ============================================================
+
+Xmat      <- as.matrix(Xtr)
+Xtest_mat <- as.matrix(Xte)
+
+# Binary target: 0/1 using positive class
+levs      <- levels(ytr)
+neg_class <- levs[1]
+pos_class <- levs[2]
+
+y_bin <- ifelse(ytr == pos_class, 1L, 0L)
+
+# 80/20 split
+set.seed(101)
+n        <- nrow(Xmat)
+val_frac <- 0.2
+val_idx  <- sample(seq_len(n), size = floor(val_frac * n))
+train_idx <- setdiff(seq_len(n), val_idx)
+
+# Cross-validated ridge logistic (alpha = 0)
+cv_ridge <- cv.glmnet(
+  Xmat[train_idx, ],
+  y_bin[train_idx],
+  family       = "binomial",
+  alpha        = 0,
+  nfolds       = 5,
+  type.measure = "auc"
+)
+
+## ============================================================
+## 6. Tune probability threshold on validation set
+## ============================================================
+
+p_valid <- as.numeric(
+  predict(cv_ridge,
+          newx = Xmat[val_idx, ],
+          s    = "lambda.min",
+          type = "response")
+)
+
+thresholds <- seq(0.10, 0.90, by = 0.01)
+
+acc_vec <- sapply(thresholds, function(t) {
+  y_hat_num <- ifelse(p_valid > t, 1L, 0L)
+  y_hat_lab <- ifelse(y_hat_num == 1L, pos_class, neg_class)
+  mean(y_hat_lab == ytr[val_idx])
+})
+
+best_idx <- which.max(acc_vec)
+best_thr <- thresholds[best_idx]
+best_acc <- acc_vec[best_idx]
+
+cat("Best validation threshold:", best_thr, "\n")
+cat("Best validation accuracy :", best_acc, "\n")
+
+## ============================================================
+## 7. Final ridge fit on all data & Kaggle submission
+## ============================================================
+
+ridge_full <- glmnet(
+  Xmat,
+  y_bin,
+  family = "binomial",
+  alpha  = 0,
+  lambda = cv_ridge$lambda.min
+)
+
+p_test <- as.numeric(
+  predict(ridge_full,
+          newx = Xtest_mat,
+          type = "response")
+)
+
+Cancer_pred <- ifelse(p_test > best_thr, pos_class, neg_class)
+
+submission <- data.frame(
+  ID     = skin_te[[id_te]],
+  Cancer = Cancer_pred
+)
+
+write.csv(
+  submission,
+  "skin_cancer_filtered_ridge_thr_auto.csv",
+  row.names = FALSE
+)
+
+cat("Wrote submission file: skin_cancer_filtered_ridge_thr_auto.csv\n")
