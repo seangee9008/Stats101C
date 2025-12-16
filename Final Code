@@ -1,0 +1,235 @@
+## Skin Cancer 
+
+
+library(caret)
+library(glmnet)
+library(dplyr)
+
+set.seed(123)
+
+skin_tr <- read.csv("~/Downloads/SkinCancerTrain.csv")
+skin_te <- read.csv("~/Downloads/SkinCancerTestNoY.csv")
+
+
+## 1. Drop weak / noisy predictors
+
+drop_cols <- c(
+  "music_genre",
+  "favorite_cuisine",
+  "favorite_color",
+  "phone_brand",
+  "sunscreen_brand",
+  "pets",
+  "zip_code_last_digit",
+  "desk_height_cm",
+  "monthly_screen_time_minutes",
+  "commute_minutes",
+  "years_lived_at_address",
+  "access_to_nude_beach",
+  "near_high_power_cables",
+  "uses_smartwatch",
+  "preferred_shoe_type"
+)
+
+keep_tr <- setdiff(names(skin_tr), drop_cols)
+keep_te <- setdiff(names(skin_te), drop_cols)
+
+skin_tr <- skin_tr[, keep_tr, drop = FALSE]
+skin_te <- skin_te[, keep_te, drop = FALSE]
+
+
+## 2. IDs and outcome
+
+id_tr <- names(skin_tr)[1]
+id_te <- names(skin_te)[1]
+
+skin_tr$Cancer <- factor(skin_tr$Cancer)
+# event level first for twoClassSummary ("Malignant" = positive)
+skin_tr$Cancer <- relevel(skin_tr$Cancer, ref = "Malignant")
+
+
+## 3. Helper: Mode
+
+
+Mode <- function(x) {
+  x <- x[!is.na(x)]
+  if (!length(x)) return(NA)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+
+## 4. Numeric vs categorical
+
+num_cols <- setdiff(
+  names(skin_tr)[sapply(skin_tr, is.numeric)],
+  c(id_tr, "Cancer")
+)
+
+cat_cols <- setdiff(
+  names(skin_tr),
+  c(id_tr, "Cancer", num_cols)
+)
+
+## 5. Median / mode imputation
+
+tr_imp <- skin_tr
+te_imp <- skin_te
+
+## 5a. Numeric → global TRAIN median
+for (nm in num_cols) {
+  med <- median(tr_imp[[nm]], na.rm = TRUE)
+  tr_imp[[nm]][is.na(tr_imp[[nm]])] <- med
+  te_imp[[nm]][is.na(te_imp[[nm]])] <- med
+}
+
+## 5b. Categorical → TRAIN mode; align factor levels
+for (nm in cat_cols) {
+  tr_imp[[nm]] <- as.character(tr_imp[[nm]])
+  te_imp[[nm]] <- as.character(te_imp[[nm]])
+
+  md <- Mode(tr_imp[[nm]])
+  tr_imp[[nm]][is.na(tr_imp[[nm]])] <- md
+  te_imp[[nm]][is.na(te_imp[[nm]])] <- md
+
+  lv <- union(unique(tr_imp[[nm]]), unique(te_imp[[nm]]))
+  tr_imp[[nm]] <- factor(tr_imp[[nm]], levels = lv)
+  te_imp[[nm]] <- factor(te_imp[[nm]], levels = lv)
+}
+
+cat("Remaining NAs, Train:", sum(is.na(tr_imp)), "\n")
+cat("Remaining NAs, Test :", sum(is.na(te_imp)), "\n")
+
+## 6. Feature engineering (nonlinear terms)
+
+
+tr_imp <- tr_imp %>%
+  mutate(
+    log_lesion_size = log1p(lesion_size_mm),
+    log_num_lesions = log1p(number_of_lesions),
+    age2            = age^2
+  )
+
+te_imp <- te_imp %>%
+  mutate(
+    log_lesion_size = log1p(lesion_size_mm),
+    log_num_lesions = log1p(number_of_lesions),
+    age2            = age^2
+  )
+
+## 7. Predictor sets 
+
+base_vars <- c(
+  "age",
+  "avg_daily_uv",
+  "sunburns_last_year",
+  "lesion_size_mm",
+  "number_of_lesions",
+  "skin_tone",
+  "sunscreen_freq",
+  "hat_use",
+  "clothing_protection",
+  "tanning_bed_use",
+  "outdoor_job",
+  "family_history",
+  "immunosuppressed",
+  "skin_photosensitivity",
+  "distance_from_beach_km",
+  "residence_lat",
+  "residence_lon",
+  "lesion_color"
+)
+
+my_extra_vars <- c(
+  "BMI",
+  "urban_rural",
+  "income",
+  "exercise_freq_per_week"
+)
+
+engineered_vars <- c(
+  "log_lesion_size",
+  "log_num_lesions",
+  "age2"
+)
+
+main_effects_all <- intersect(
+  c(base_vars, my_extra_vars, engineered_vars),
+  names(tr_imp)
+)
+
+
+## 8. Elastic-net formula with interactions
+
+
+enet_formula <- as.formula(
+  paste(
+    "Cancer ~",
+    paste(main_effects_all, collapse = " + "),
+    # interactions
+    "+ avg_daily_uv:sunscreen_freq",
+    "+ lesion_size_mm:number_of_lesions",
+    "+ avg_daily_uv:outdoor_job",
+    "+ lesion_size_mm:immunosuppressed"
+  )
+)
+
+print(enet_formula)
+
+
+## 9. Train glmnet via caret (elastic net / ridge / lasso)
+
+
+ctrl_enet <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+alpha_grid  <- c(0, 0.25, 0.5, 0.75, 1)          # ridge → enet → lasso
+lambda_grid <- 10 ^ seq(-3, 1, length.out = 40)
+
+enet_grid <- expand.grid(
+  alpha  = alpha_grid,
+  lambda = lambda_grid
+)
+
+enet_fit <- train(
+  enet_formula,
+  data      = tr_imp,
+  method    = "glmnet",
+  family    = "binomial",
+  trControl = ctrl_enet,
+  metric    = "ROC",
+  tuneGrid  = enet_grid
+)
+
+print(enet_fit$bestTune)
+print(enet_fit$results[which.max(enet_fit$results$ROC),
+                       c("alpha", "lambda", "ROC")])
+
+# optional:
+# importance <- varImp(enet_fit, scale = TRUE)
+# plot(importance, top = 20)
+
+
+## 10. Kaggle submission (label format: ID, Cancer)
+
+
+pos_class <- "Malignant"
+
+prob_mat <- predict(enet_fit, newdata = te_imp, type = "prob")
+prob_te  <- prob_mat[, pos_class]
+
+Cancer_pred <- ifelse(prob_te > 0.5, "Malignant", "Benign")
+
+submission <- data.frame(
+  ID     = te_imp[[id_te]],   # column name exactly "ID"
+  Cancer = Cancer_pred
+)
+
+write.csv(
+  submission,
+  "skin_cancer_enet_v3.csv",
+  row.names = FALSE
